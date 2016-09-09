@@ -1,83 +1,17 @@
-/**
- * Utility class to automatically create Redux reducers for REST API endpoints.
- */
-// TODO make ajax library pluggable
-import agent from 'superagent';
-import itemStatus from './itemStatus';
+import fetch from 'isomorphic-fetch';
 
-export { itemStatus };
+export const itemStatus = {
+    pending: 'pending',
+    saved: 'saved',
+    failed: 'failed',
+    initial: 'initial'
+};
 
-export const asyncDispatch = store => next => action =>
-  typeof action === 'function' ?
-  action(store.dispatch, store.getState) :
-  next(action);
-
-
-export class Endpoint {
-  constructor(url) {
-    this.url = url;
-  }
-
-  list(params) {
-    return agent.get(this.url).query(params);
-  }
-
-  retrieve(id) {
-    return agent.get(this._getObjectURL(id));
-  }
-
-  create(conf) {
-    return this._setCSRFHeader(agent.post(this.url)).send(conf);
-  }
-
-  update(conf, id) {
-    return this._setCSRFHeader(agent.put(this._getObjectURL(id))).send(conf);
-  }
-
-  _getObjectURL(id) {
-    let slash = '';
-    if (!this.url.endsWith('/')) {
-      slash = '/';
-    }
-    return `${this.url}${slash}${id}`;
-  }
-
-  _setCSRFHeader(request) {
-    // TODO this is django specific, needs to be customisable
-    if (!this._csrfSafeMethod(request.method)) {  // && !this.crossDomain) {
-      request.set('X-CSRFToken', this._getCookie('csrftoken'));
-    }
-    return request;
-  }
-
-  // Set csrf token for ajax requests
-  // See https://docs.djangoproject.com/en/dev/ref/csrf/#ajax
-  _getCookie(name) {
-    let cookieValue = null;
-    if (document.cookie && document.cookie !== '') {
-      let cookies = document.cookie.split(';');
-      for (let i = 0; i < cookies.length; i++) {
-        let cookie = cookies[i].trim();
-        // Does this cookie string begin with the name we want?
-        if (cookie.substring(0, name.length + 1) === (name + '=')) {
-          cookieValue = decodeURIComponent(cookie.substring(name.length + 1));
-          break;
-        }
-      }
-    }
-    return cookieValue;
-  }
-
-  _csrfSafeMethod(method) {
-    // these HTTP methods do not require CSRF protection
-    return (/^(GET|HEAD|OPTIONS|TRACE)$/.test(method));
-  }
-}
 
 export class ActionTypes {
   constructor(endpointName) {
     this.endpointName = endpointName;
-    ['list', 'retrieve', 'create', 'update'].forEach(action => {
+    ['list', 'retrieve', 'create', 'update', 'delete'].forEach(action => {
       this[`${action}`] = this.getConstant(action);
       ['success', 'failure'].forEach(result => {
         this[`${action}_${result}`] = this.getConstant(action, result);
@@ -98,20 +32,23 @@ export class ActionCreators {
   constructor(endpointName, API, actionTypes) {
     this.actionTypes = actionTypes;
     this._pendingID = 0;
-    ['list', 'retrieve', 'create', 'update'].forEach(action => {
-      this[action] = this._createAction.bind(this, action, API[action].bind(API));
+    ['list', 'retrieve', 'create', 'update', 'delete'].forEach(action => {
+      this[action] = this._createAction.bind(this, action, API);
     });
   }
 
-  _createAction(action, apiRequest, payload, objectID) {
-    return (dispatch) => {
+  // apiRequest is a function which accepts params and return an endpint
+  // params are used to generate endpint
+  // payload is param for endpoint methods(BREAD), should be null by default
+  _createAction(action, apiRequest, payload) {
+    return dispatch => {
       let pendingID = this._getPendingID();
-      let call = apiRequest(payload, objectID)
-          .end((err, res) => {
+      let call = apiRequest[action](payload)
+          .then(({err, res}) => {
             if (err) {
-              dispatch(this._failure(action, 'error', pendingID));
+              return dispatch(this._failure(action, 'error', pendingID));
             } else {
-              dispatch(this._success(action, res.body, pendingID));
+              return dispatch(this._success(action, res, pendingID));
             }
           });
       dispatch(this._pending(action, payload, pendingID));
@@ -146,6 +83,7 @@ export class ActionCreators {
   }
 }
 
+
 class BaseReducer {
   constructor(actionTypes) {
     this.actionTypes = actionTypes;
@@ -165,94 +103,84 @@ class BaseReducer {
     newState.splice(index, 1, newItem);
     return newState;
   }
+
+  _getIndex(state, key, value) {
+    return state.findIndex(item => item[key] === value);
+  }
+
+  _deleteItem(state, key, value) {
+    const index = this._getIndex(state, key, value);
+    state.splice(index,1);
+    if(i >= 0) return [...state];
+  }
 }
 
 export class ItemReducer extends BaseReducer {
 
-  _reducer(state = [], action) {
-    let item;
-    if (action.type === this.actionTypes.create) {
-      item = {...action.payload, status: itemStatus.pending, pendingID: action.pendingID};
-      return [...state, item];
-
-    } else if (action.type === this.actionTypes.create_success) {
-      item = {...action.payload, status: itemStatus.saved};
-      return this._replaceItem(state, 'pendingID', action.pendingID, item);
-
-    } else if (action.type === this.actionTypes.create_failure) {
-      item = this._getItem(state, 'pendingID', action.pendingID);
-      item.status = itemStatus.failed;
-      return this._replaceItem(state, 'pendingID', action.pendingID, item);
-
-    } else if (action.type === this.actionTypes.update) {
-      item = {...action.payload, status: itemStatus.pending};
-      // TODO shouldn't hardcode 'id' field
-      return this._replaceItem(state, 'id', item.id, item);
-
-    } else if (action.type === this.actionTypes.update_success) {
-      item = {...action.payload, status: itemStatus.saved};
-      // TODO shouldn't hardcode 'id' field
-      return this._replaceItem(state, 'id', item.id, item);
-
-    } else if (action.type === this.actionTypes.update_failure) {
-      item = {...action.payload, status: itemStatus.failed};
-      // TODO shouldn't hardcode 'id' field
-      return this._replaceItem(state, 'id', item.id, item);
-
-    } else if (action.type === this.actionTypes.list_success) {
-      return [...action.payload];
-
+  _reducer(state = {'@status': itemStatus.initial}, action) {
+    switch(action.type) {
+      case this.actionTypes.create:
+        return {...state, '@status': itemStatus.pending, '@pendingID': action.pendingID};
+      case this.actionTypes.create_success:
+        return {...action.payload, '@status': itemStatus.saved};
+      case this.actionTypes.create_failure:
+        return {...action.payload, '@status': itemStatus.failed};
+      case this.actionTypes.update:
+        return {...state, '@status': itemStatus.pending, '@pendingID': action.pendingID};
+        // TODO shouldn't hardcode 'id' field
+      case this.actionTypes.update_success:
+        return {...action.payload, '@status': itemStatus.saved};
+        // TODO shouldn't hardcode 'id' field
+      case this.actionTypes.update_failure:
+        return {...action.payload, '@status': itemStatus.failed};
+        // TODO shouldn't hardcode 'id' field
+      case this.actionTypes.delete:
+        return {...state, '@status': itemStatus.pending, '@pendingID': action.pendingID};
+      case this.actionTypes.delete_success:
+        return {...action.payload, '@status': itemStatus.saved};
+      case this.actionTypes.delete_failure:
+        return {...action.payload, '@status': itemStatus.failed};
+      case this.actionTypes.retrieve:
+        return {...state, '@status': itemStatus.pending, '@pendingID': action.pendingID};
+      case this.actionTypes.retrieve_success:
+        return {...action.payload, '@status': itemStatus.saved};
+      case this.actionTypes.retrieve_failure:
+        return {...action.payload, '@status': itemStatus.failed};
+      default:
+        return state;
     }
-    return state;
   }
 }
 
 export class CollectionReducer extends BaseReducer {
 
-  _reducer(state = [], action) {
-    let item;
-    if (action.type === this.actionTypes.list) {
-      item = {
-        action: 'list',
-        status: itemStatus.pending,
-        pendingID: action.pendingID
-      };
-      return [...state, item];
-
-    } else if (action.type === this.actionTypes.list_success) {
-      item = {action: 'list', status: itemStatus.saved};
-      return this._replaceItem(state, 'pendingID', action.pendingID, item);
-
-    } else if (action.type === this.actionTypes.list_failure) {
-      item = {action: 'list', status: itemStatus.failed};
-      return this._replaceItem(state, 'pendingID', action.pendingID, item);
+  _reducer(state = {'@status': itemStatus.initial}, action) {
+    switch (action.type) {
+      case this.actionTypes.list:
+        return {...state, '@status': itemStatus.pending, '@pendingID': action.pendingID};
+      case this.actionTypes.list_success:
+        return {...action.payload, '@status': itemStatus.saved};
+      case this.actionTypes.list_failure:
+        return {...action.payload, '@status': itemStatus.failed};
+      default:
+        return state;
     }
-
-    return state;
   }
 }
 
 export default class Flux {
-  constructor(APIConf) {
+  constructor(api) {
+    self = this;
     this.API = {};
     this.actionTypes = {};
     this.actionCreators = {};
     this.reducers = {};
-    for (let endpointName in APIConf) {
-      if (APIConf.hasOwnProperty(endpointName)) {
-        let url = APIConf[endpointName];
-        this.API[endpointName] = new Endpoint(url);
-        this.actionTypes[endpointName] = new ActionTypes(endpointName);
-        this.actionCreators[endpointName] = new ActionCreators(
-          endpointName,
-          this.API[endpointName],
-          this.actionTypes[endpointName]
-        );
-        this.reducers[`${endpointName}_items`] = new ItemReducer(
-          this.actionTypes[endpointName]).getReducer();
-        this.reducers[`${endpointName}_collection`] = new CollectionReducer(
-          this.actionTypes[endpointName]).getReducer();
-      }
-    }
+    Object.keys(api).forEach(endpointName => {
+      self.API[endpointName] = api[endpointName];
+      self.actionTypes[endpointName] = new ActionTypes(endpointName);
+      self.actionCreators[endpointName] = (params) => new ActionCreators(endpointName, self.API[endpointName](params), self.actionTypes[endpointName]);
+      self.reducers[`${endpointName}_item`] = new ItemReducer(self.actionTypes[endpointName]).getReducer();
+      self.reducers[`${endpointName}_collection`] = new CollectionReducer(self.actionTypes[endpointName]).getReducer();
+    })
   }
 }
